@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  mysql-master1:
+    image: mysql:8.0
+    container_name: mysql-master1
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: demo_db
+      MYSQL_USER: replicator
+      MYSQL_PASSWORD: replicatorpass
+    ports:
+      - "33061:3306"
+    volumes:
+      - ./mysql-master1.cnf:/etc/mysql/conf.d/replication.cnf
+      - ./init-master1.sql:/docker-entrypoint-initdb.d/init-master1.sql
+      - master1-data:/var/lib/mysql
+    networks:
+      - db-network
+    command: --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --gtid-mode=ON --enforce-gtid-consistency=ON
+
+  mysql-master2:
+    image: mysql:8.0
+    container_name: mysql-master2
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: demo_db
+      MYSQL_USER: replicator
+      MYSQL_PASSWORD: replicatorpass
+    ports:
+      - "33062:3306"
+    volumes:
+      - ./mysql-master2.cnf:/etc/mysql/conf.d/replication.cnf
+      - ./init-master2.sql:/docker-entrypoint-initdb.d/init-master2.sql
+      - master2-data:/var/lib/mysql
+    networks:
+      - db-network
+    command: --server-id=2 --log-bin=mysql-bin --binlog-format=ROW --gtid-mode=ON --enforce-gtid-consistency=ON
+    depends_on:
+      - mysql-master1
+
+  mysql-slave:
+    image: mysql:8.0
+    container_name: mysql-slave
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: demo_db
+    ports:
+      - "33063:3306"
+    volumes:
+      - ./mysql-slave.cnf:/etc/mysql/conf.d/replication.cnf
+      - ./init-slave.sql:/docker-entrypoint-initdb.d/init-slave.sql
+      - slave-data:/var/lib/mysql
+    networks:
+      - db-network
+    command: --server-id=3 --log-bin=mysql-bin --binlog-format=ROW --gtid-mode=ON --enforce-gtid-consistency=ON --read-only=ON
+    depends_on:
+      - mysql-master1
+      - mysql-master2
+
+  proxysql:
+    image: proxysql/proxysql:latest
+    container_name: proxysql
+    ports:
+      - "6032:6032"  # Admin interface
+      - "6033:6033"  # MySQL interface (for applications)
+    volumes:
+      - ./proxysql.cnf:/etc/proxysql.cnf
+      - ./proxysql-init.sql:/docker-entrypoint-initdb.d/proxysql-init.sql
+    networks:
+      - db-network
+    depends_on:
+      - mysql-master1
+      - mysql-master2
+      - mysql-slave
+    restart: unless-stopped
+
+volumes:
+  master1-data:
+  master2-data:
+  slave-data:
+
+networks:
+  db-network:
+    driver: bridge
+
