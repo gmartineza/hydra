@@ -70,38 +70,87 @@ docker-compose logs mysql-master2
 docker-compose logs mysql-slave
 ```
 
-### 3. Set Up Replication
+### 3. Configure ProxySQL Monitor User
 
-Run the replication setup script:
+Before setting up replication, create the monitor user for ProxySQL health checks:
+
+```bash
+# Create monitor user on all nodes
+docker exec mysql-master1 mysql -uroot -prootpassword -e "CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor'; GRANT REPLICATION CLIENT ON *.* TO 'monitor'@'%'; FLUSH PRIVILEGES;"
+docker exec mysql-master2 mysql -uroot -prootpassword -e "CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor'; GRANT REPLICATION CLIENT ON *.* TO 'monitor'@'%'; FLUSH PRIVILEGES;"
+docker exec mysql-slave mysql -uroot -prootpassword -e "CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor'; GRANT REPLICATION CLIENT ON *.* TO 'monitor'@'%'; FLUSH PRIVILEGES;"
+
+# Configure ProxySQL to use monitor credentials
+docker exec proxysql mysql -h 127.0.0.1 -P 6032 -u admin -padmin -e "SET mysql-monitor_username='monitor'; SET mysql-monitor_password='monitor'; SET mysql-monitor_ssl='false'; LOAD MYSQL VARIABLES TO RUNTIME; SAVE MYSQL VARIABLES TO DISK;"
+```
+
+Wait 10-15 seconds, then verify ProxySQL can see all servers:
+
+```bash
+docker exec proxysql mysql -h 127.0.0.1 -P 6032 -u admin -padmin -e "SELECT hostname, port, hostgroup_id, status FROM runtime_mysql_servers;"
+```
+
+All servers should show `status = 'ONLINE'`.
+
+### 4. Set Up Replication
+
+**Important:** MySQL 8.0 uses `caching_sha2_password` by default, which requires SSL. We need to change the replicator user to use `mysql_native_password` for replication to work without SSL.
+
+First, update the authentication method for the replicator user:
+
+```bash
+# Change replicator user to use mysql_native_password on all nodes
+docker exec mysql-master1 mysql -uroot -prootpassword -e "ALTER USER 'replicator'@'%' IDENTIFIED WITH mysql_native_password BY 'replicatorpass'; FLUSH PRIVILEGES;"
+docker exec mysql-master2 mysql -uroot -prootpassword -e "ALTER USER 'replicator'@'%' IDENTIFIED WITH mysql_native_password BY 'replicatorpass'; FLUSH PRIVILEGES;"
+docker exec mysql-slave mysql -uroot -prootpassword -e "ALTER USER 'replicator'@'%' IDENTIFIED WITH mysql_native_password BY 'replicatorpass'; FLUSH PRIVILEGES;"
+```
+
+Then configure replication:
+
+```bash
+# Configure Master2 to replicate from Master1
+docker exec mysql-master2 mysql -uroot -prootpassword -e "CHANGE MASTER TO MASTER_HOST='mysql-master1', MASTER_USER='replicator', MASTER_PASSWORD='replicatorpass', MASTER_AUTO_POSITION=1; START SLAVE;"
+
+# Configure Master1 to replicate from Master2
+docker exec mysql-master1 mysql -uroot -prootpassword -e "CHANGE MASTER TO MASTER_HOST='mysql-master2', MASTER_USER='replicator', MASTER_PASSWORD='replicatorpass', MASTER_AUTO_POSITION=1; START SLAVE;"
+
+# Configure Slave to replicate from Master1
+docker exec mysql-slave mysql -uroot -prootpassword -e "CHANGE MASTER TO MASTER_HOST='mysql-master1', MASTER_USER='replicator', MASTER_PASSWORD='replicatorpass', MASTER_AUTO_POSITION=1; START SLAVE;"
+```
+
+**Note:** If you see CREATE USER errors in the logs after starting replication, you may need to skip the initial GTID transaction that tries to replicate the user creation. See Troubleshooting section for details.
+
+**Alternative:** Run the replication setup script (if using bash):
 
 ```bash
 chmod +x setup-replication.sh
 ./setup-replication.sh
 ```
 
-This script will:
-- Configure master-master replication between Master1 and Master2
-- Configure the Slave to replicate from Master1
-- Verify replication status
+**Note for Windows:** If you're on Windows and can't run the bash script directly, use the manual commands above.
 
-**Note for Windows:** If you're on Windows and can't run the bash script directly, you can execute the commands manually (see Manual Setup section below).
-
-### 4. Verify Replication
+### 5. Verify Replication
 
 Check replication status on each node:
 
 ```bash
 # Master1 replicating from Master2
-docker exec mysql-master1 mysql -uroot -prootpassword -e "SHOW SLAVE STATUS\G" | grep -E "Slave_IO_Running|Slave_SQL_Running"
+docker exec mysql-master1 mysql -uroot -prootpassword -e "SHOW SLAVE STATUS\G" | grep -E "Slave_IO_Running|Slave_SQL_Running|Master_Host|Last_IO_Error|Last_SQL_Error"
 
 # Master2 replicating from Master1
-docker exec mysql-master2 mysql -uroot -prootpassword -e "SHOW SLAVE STATUS\G" | grep -E "Slave_IO_Running|Slave_SQL_Running"
+docker exec mysql-master2 mysql -uroot -prootpassword -e "SHOW SLAVE STATUS\G" | grep -E "Slave_IO_Running|Slave_SQL_Running|Master_Host|Last_IO_Error|Last_SQL_Error"
 
 # Slave replicating from Master1
-docker exec mysql-slave mysql -uroot -prootpassword -e "SHOW SLAVE STATUS\G" | grep -E "Slave_IO_Running|Slave_SQL_Running"
+docker exec mysql-slave mysql -uroot -prootpassword -e "SHOW SLAVE STATUS\G" | grep -E "Slave_IO_Running|Slave_SQL_Running|Master_Host|Last_IO_Error|Last_SQL_Error"
 ```
 
-All should show `Slave_IO_Running: Yes` and `Slave_SQL_Running: Yes`.
+**Expected output:**
+- `Slave_IO_Running: Yes`
+- `Slave_SQL_Running: Yes`
+- `Master_Host: mysql-master1` (for Master2 and Slave)
+- `Master_Host: mysql-master2` (for Master1)
+- `Last_IO_Error:` (should be empty)
+- `Last_SQL_Error:` (should be empty)
 
 ## Database Schema
 
@@ -224,7 +273,30 @@ chmod +x test-failover.sh
 
 If you can't run the bash scripts, execute these commands manually:
 
-### Set Up Master-Master Replication
+### Step 1: Create Monitor User (Required for ProxySQL)
+
+```bash
+# Create monitor user on all nodes
+docker exec mysql-master1 mysql -uroot -prootpassword -e "CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor'; GRANT REPLICATION CLIENT ON *.* TO 'monitor'@'%'; FLUSH PRIVILEGES;"
+docker exec mysql-master2 mysql -uroot -prootpassword -e "CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor'; GRANT REPLICATION CLIENT ON *.* TO 'monitor'@'%'; FLUSH PRIVILEGES;"
+docker exec mysql-slave mysql -uroot -prootpassword -e "CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor'; GRANT REPLICATION CLIENT ON *.* TO 'monitor'@'%'; FLUSH PRIVILEGES;"
+
+# Configure ProxySQL
+docker exec proxysql mysql -h 127.0.0.1 -P 6032 -u admin -padmin -e "SET mysql-monitor_username='monitor'; SET mysql-monitor_password='monitor'; SET mysql-monitor_ssl='false'; LOAD MYSQL VARIABLES TO RUNTIME; SAVE MYSQL VARIABLES TO DISK;"
+```
+
+### Step 2: Fix Replication Authentication
+
+MySQL 8.0 requires changing the replicator user authentication method:
+
+```bash
+# Change replicator user to use mysql_native_password on all nodes
+docker exec mysql-master1 mysql -uroot -prootpassword -e "ALTER USER 'replicator'@'%' IDENTIFIED WITH mysql_native_password BY 'replicatorpass'; FLUSH PRIVILEGES;"
+docker exec mysql-master2 mysql -uroot -prootpassword -e "ALTER USER 'replicator'@'%' IDENTIFIED WITH mysql_native_password BY 'replicatorpass'; FLUSH PRIVILEGES;"
+docker exec mysql-slave mysql -uroot -prootpassword -e "ALTER USER 'replicator'@'%' IDENTIFIED WITH mysql_native_password BY 'replicatorpass'; FLUSH PRIVILEGES;"
+```
+
+### Step 3: Set Up Master-Master Replication
 
 ```bash
 # Configure Master2 to replicate from Master1
@@ -236,6 +308,8 @@ docker exec mysql-master1 mysql -uroot -prootpassword -e "CHANGE MASTER TO MASTE
 # Configure Slave to replicate from Master1
 docker exec mysql-slave mysql -uroot -prootpassword -e "CHANGE MASTER TO MASTER_HOST='mysql-master1', MASTER_USER='replicator', MASTER_PASSWORD='replicatorpass', MASTER_AUTO_POSITION=1; START SLAVE;"
 ```
+
+**Note:** If you encounter CREATE USER errors in the logs, see the Troubleshooting section for how to skip the problematic GTID transaction.
 
 ### Verify Replication
 

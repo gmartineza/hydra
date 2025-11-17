@@ -144,6 +144,165 @@ docker exec proxysql mysql -h 127.0.0.1 -P 6032 -u admin -padmin -e "SELECT host
 
 ---
 
+## Issue 3: Replication Authentication Failure
+
+### Symptoms
+- Replication shows `Slave_IO_Running: Connecting` (never becomes `Yes`)
+- Error logs show: `Authentication plugin 'caching_sha2_password' reported error: Authentication requires secure connection`
+- Error code: `MY-002061`
+
+### Root Cause
+MySQL 8.0 uses `caching_sha2_password` as the default authentication plugin. This plugin requires SSL/TLS for remote connections, but our replication setup doesn't use SSL. The replication IO thread cannot authenticate without SSL.
+
+### Diagnostic Commands Used
+
+```bash
+# Check slave status
+docker exec mysql-master1 mysql -uroot -prootpassword -e "SHOW SLAVE STATUS\G" | grep -E "Slave_IO_Running|Last_IO_Error"
+
+# Check MySQL error logs
+docker-compose logs mysql-master1 | grep -i "authentication\|caching_sha2"
+
+# Check replicator user authentication plugin
+docker exec mysql-master1 mysql -uroot -prootpassword -e "SELECT user, host, plugin FROM mysql.user WHERE user='replicator';"
+```
+
+### Error Messages Found
+```
+[ERROR] [MY-010584] [Repl] Replica I/O for channel '': Error connecting to source 'replicator@mysql-master2:3306'. 
+This was attempt 7/86400, with a delay of 60 seconds between attempts. 
+Message: Authentication plugin 'caching_sha2_password' reported error: Authentication requires secure connection. 
+Error_code: MY-002061
+```
+
+### Solution
+
+**Step 1: Change replicator user authentication method**
+
+Change the replicator user from `caching_sha2_password` to `mysql_native_password` on all nodes:
+
+```bash
+# Master1
+docker exec mysql-master1 mysql -uroot -prootpassword -e "ALTER USER 'replicator'@'%' IDENTIFIED WITH mysql_native_password BY 'replicatorpass'; FLUSH PRIVILEGES;"
+
+# Master2
+docker exec mysql-master2 mysql -uroot -prootpassword -e "ALTER USER 'replicator'@'%' IDENTIFIED WITH mysql_native_password BY 'replicatorpass'; FLUSH PRIVILEGES;"
+
+# Slave
+docker exec mysql-slave mysql -uroot -prootpassword -e "ALTER USER 'replicator'@'%' IDENTIFIED WITH mysql_native_password BY 'replicatorpass'; FLUSH PRIVILEGES;"
+```
+
+**Expected output:**
+```
+mysql: [Warning] Using a password on the command line interface can be insecure.
+(No error message - command succeeded)
+```
+
+**Step 2: Restart replication with new authentication**
+
+```bash
+# Master1 - stop, reconfigure, restart
+docker exec mysql-master1 mysql -uroot -prootpassword -e "STOP SLAVE; CHANGE MASTER TO MASTER_HOST='mysql-master2', MASTER_USER='replicator', MASTER_PASSWORD='replicatorpass', MASTER_AUTO_POSITION=1; START SLAVE;"
+
+# Master2 - stop, reconfigure, restart
+docker exec mysql-master2 mysql -uroot -prootpassword -e "STOP SLAVE; CHANGE MASTER TO MASTER_HOST='mysql-master1', MASTER_USER='replicator', MASTER_PASSWORD='replicatorpass', MASTER_AUTO_POSITION=1; START SLAVE;"
+
+# Slave - stop, reconfigure, restart
+docker exec mysql-slave mysql -uroot -prootpassword -e "STOP SLAVE; CHANGE MASTER TO MASTER_HOST='mysql-master1', MASTER_USER='replicator', MASTER_PASSWORD='replicatorpass', MASTER_AUTO_POSITION=1; START SLAVE;"
+```
+
+**Step 3: Verify replication status**
+
+Wait 5-10 seconds, then check:
+
+```bash
+docker exec mysql-master1 mysql -uroot -prootpassword -e "SHOW SLAVE STATUS\G" | grep -E "Slave_IO_Running|Slave_SQL_Running|Master_Host|Last_IO_Error"
+```
+
+**Expected output:**
+```
+Master_Host: mysql-master2
+Slave_IO_Running: Yes
+Slave_SQL_Running: Yes
+Last_IO_Error: 
+```
+
+**Result:** Replication IO thread successfully connects and replication works ✅
+
+---
+
+## Issue 4: CREATE USER Replication Error
+
+### Symptoms
+- Replication shows `Slave_SQL_Running: No` or errors in logs
+- Error: `Operation CREATE USER failed for 'replicator'@'%'`
+- Error code: `MY-001396`
+- Error occurs when replication tries to replicate the CREATE USER statement from initialization scripts
+
+### Root Cause
+The initialization scripts create the `replicator` user. When replication starts, it tries to replicate this CREATE USER statement, but the user already exists on the replica, causing a conflict.
+
+### Diagnostic Commands Used
+
+```bash
+# Check slave SQL status and errors
+docker exec mysql-master1 mysql -uroot -prootpassword -e "SHOW SLAVE STATUS\G" | grep -E "Slave_SQL_Running|Last_SQL_Error"
+
+# Check MySQL error logs
+docker-compose logs mysql-master1 | grep -i "CREATE USER\|replicator"
+```
+
+### Error Messages Found
+```
+[ERROR] [MY-010584] [Repl] Replica SQL for channel '': Worker 1 failed executing transaction 
+'7e6ececb-c185-11f0-9733-a629fd2330b3:7' at source log mysql-bin.000002, end_log_pos 2985090; 
+Error 'Operation CREATE USER failed for 'replicator'@'%'' on query. 
+Default database: 'mysql'. Query: 'CREATE USER 'replicator'@'%' IDENTIFIED WITH 'caching_sha2_password'...', 
+Error_code: MY-001396
+```
+
+### Solution
+
+**Option 1: Skip the problematic GTID transaction**
+
+If you see a specific GTID in the error (e.g., `7e6ececb-c185-11f0-9733-a629fd2330b3:7`), skip it:
+
+```bash
+# Replace the GTID with the one from your error message
+docker exec mysql-master1 mysql -uroot -prootpassword -e "STOP SLAVE; SET GTID_NEXT='7e6ececb-c185-11f0-9733-a629fd2330b3:7'; BEGIN; COMMIT; SET GTID_NEXT='AUTOMATIC'; START SLAVE;"
+```
+
+**Expected output:**
+```
+mysql: [Warning] Using a password on the command line interface can be insecure.
+(No error message - command succeeded)
+```
+
+**Option 2: Skip one transaction (if GTID not available)**
+
+```bash
+docker exec mysql-master1 mysql -uroot -prootpassword -e "STOP SLAVE; SET GLOBAL sql_slave_skip_counter = 1; START SLAVE;"
+```
+
+**Step 3: Verify replication resumes**
+
+```bash
+docker exec mysql-master1 mysql -uroot -prootpassword -e "SHOW SLAVE STATUS\G" | grep -E "Slave_IO_Running|Slave_SQL_Running|Last_SQL_Error"
+```
+
+**Expected output:**
+```
+Slave_IO_Running: Yes
+Slave_SQL_Running: Yes
+Last_SQL_Error: 
+```
+
+**Result:** Replication SQL thread resumes and replication works normally ✅
+
+**Note:** This error typically only occurs during initial replication setup. Once replication is established, it shouldn't recur.
+
+---
+
 ## Final Working Configuration
 
 ### ProxySQL Server Status
@@ -162,6 +321,11 @@ Expected output:
 - All servers have `monitor` user with `REPLICATION CLIENT` privilege
 - ProxySQL configured with `mysql-monitor_username='monitor'` and `mysql-monitor_password='monitor'`
 - SSL disabled for monitoring: `mysql-monitor_ssl='false'`
+- Replicator user uses `mysql_native_password` authentication (not `caching_sha2_password`)
+- Replication configured and running on all nodes:
+  - Master1 replicating from Master2
+  - Master2 replicating from Master1
+  - Slave replicating from Master1
 
 ---
 
@@ -192,6 +356,40 @@ docker exec proxysql mysql -h 127.0.0.1 -P 6032 -u admin -padmin -e "SET mysql-m
 
 # Disable SSL for specific server
 docker exec proxysql mysql -h 127.0.0.1 -P 6032 -u admin -padmin -e "UPDATE mysql_servers SET use_ssl=0 WHERE hostname='<hostname>'; LOAD MYSQL SERVERS TO RUNTIME; SAVE MYSQL SERVERS TO DISK;"
+```
+
+### Issue: Replication Authentication Failure
+
+**Symptoms:**
+- `Slave_IO_Running: Connecting` (never becomes `Yes`)
+- Error: `Authentication plugin 'caching_sha2_password' reported error: Authentication requires secure connection`
+
+**Quick Fix:**
+```bash
+# Change replicator user to use mysql_native_password on all nodes
+docker exec mysql-master1 mysql -uroot -prootpassword -e "ALTER USER 'replicator'@'%' IDENTIFIED WITH mysql_native_password BY 'replicatorpass'; FLUSH PRIVILEGES;"
+docker exec mysql-master2 mysql -uroot -prootpassword -e "ALTER USER 'replicator'@'%' IDENTIFIED WITH mysql_native_password BY 'replicatorpass'; FLUSH PRIVILEGES;"
+docker exec mysql-slave mysql -uroot -prootpassword -e "ALTER USER 'replicator'@'%' IDENTIFIED WITH mysql_native_password BY 'replicatorpass'; FLUSH PRIVILEGES;"
+
+# Restart replication
+docker exec mysql-master1 mysql -uroot -prootpassword -e "STOP SLAVE; START SLAVE;"
+docker exec mysql-master2 mysql -uroot -prootpassword -e "STOP SLAVE; START SLAVE;"
+docker exec mysql-slave mysql -uroot -prootpassword -e "STOP SLAVE; START SLAVE;"
+```
+
+### Issue: CREATE USER Replication Error
+
+**Symptoms:**
+- `Slave_SQL_Running: No`
+- Error: `Operation CREATE USER failed for 'replicator'@'%'`
+
+**Quick Fix:**
+```bash
+# Skip the problematic GTID (replace with actual GTID from error)
+docker exec mysql-master1 mysql -uroot -prootpassword -e "STOP SLAVE; SET GTID_NEXT='<GTID_FROM_ERROR>'; BEGIN; COMMIT; SET GTID_NEXT='AUTOMATIC'; START SLAVE;"
+
+# Or skip one transaction
+docker exec mysql-master1 mysql -uroot -prootpassword -e "STOP SLAVE; SET GLOBAL sql_slave_skip_counter = 1; START SLAVE;"
 ```
 
 ### Issue: ProxySQL Configuration Not Loading
@@ -286,7 +484,14 @@ To avoid these issues in future deployments:
 
 3. **Set use_ssl=0 in server definitions**: Configure servers with `use_ssl=0` in ProxySQL configuration
 
-4. **Add health check verification**: Include verification steps in setup scripts to confirm all servers are ONLINE before proceeding
+4. **Fix replicator authentication in initialization**: Add `ALTER USER` command to change replicator to `mysql_native_password` in initialization scripts, or create the replicator user with `mysql_native_password` from the start:
+   ```sql
+   CREATE USER 'replicator'@'%' IDENTIFIED WITH mysql_native_password BY 'replicatorpass';
+   ```
+
+5. **Filter system tables from replication**: Consider filtering `mysql.*` database from replication to avoid CREATE USER conflicts, or use `CREATE USER IF NOT EXISTS` in initialization scripts
+
+6. **Add health check verification**: Include verification steps in setup scripts to confirm all servers are ONLINE before proceeding
 
 ---
 
