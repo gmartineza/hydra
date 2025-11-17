@@ -15,6 +15,7 @@ MASTER1_GTID=$(docker exec mysql-master1 mysql -uroot -prootpassword -e "SHOW MA
 # Configure master2 to replicate from master1
 echo "Configuring master2 to replicate from master1..."
 docker exec mysql-master2 mysql -uroot -prootpassword -e "
+STOP SLAVE;
 CHANGE MASTER TO
   MASTER_HOST='mysql-master1',
   MASTER_USER='replicator',
@@ -29,6 +30,7 @@ MASTER2_GTID=$(docker exec mysql-master2 mysql -uroot -prootpassword -e "SHOW MA
 # Configure master1 to replicate from master2
 echo "Configuring master1 to replicate from master2..."
 docker exec mysql-master1 mysql -uroot -prootpassword -e "
+STOP SLAVE;
 CHANGE MASTER TO
   MASTER_HOST='mysql-master2',
   MASTER_USER='replicator',
@@ -40,6 +42,7 @@ START SLAVE;
 # Configure slave to replicate from master1
 echo "Configuring slave to replicate from master1..."
 docker exec mysql-slave mysql -uroot -prootpassword -e "
+STOP SLAVE;
 CHANGE MASTER TO
   MASTER_HOST='mysql-master1',
   MASTER_USER='replicator',

@@ -16,7 +16,8 @@ echo ""
 
 # Function to execute SQL through ProxySQL
 execute_sql() {
-    mysql -h $PROXYSQL_HOST -P $PROXYSQL_PORT -u $MYSQL_USER -p$MYSQL_PASS $DB_NAME -e "$1"
+    docker exec proxysql mysql -h $PROXYSQL_HOST -P $PROXYSQL_PORT -u $MYSQL_USER -p$MYSQL_PASS $DB_NAME -e "$1"
+    # docker run -it --rm --network hydra_db-network mysql:8.0 mysql -h proxysql -P 6033 -u root -prootpassword demo_db -e "$1"
 }
 
 # Function to check which node is handling writes
@@ -33,6 +34,39 @@ check_writer() {
 echo "Step 1: Initial State - All nodes running"
 echo "----------------------------------------"
 check_writer
+echo ""
+
+# Verify both masters are ONLINE before proceeding
+echo "Verifying both masters are ONLINE..."
+MASTER1_STATUS=$(docker exec proxysql mysql -h 127.0.0.1 -P 6032 -u admin -padmin -e "
+SELECT status FROM runtime_mysql_servers 
+WHERE hostname = 'mysql-master1' AND hostgroup_id = 0;
+" 2>/dev/null | grep -v status | tr -d '[:space:]')
+
+MASTER2_STATUS=$(docker exec proxysql mysql -h 127.0.0.1 -P 6032 -u admin -padmin -e "
+SELECT status FROM runtime_mysql_servers 
+WHERE hostname = 'mysql-master2' AND hostgroup_id = 0;
+" 2>/dev/null | grep -v status | tr -d '[:space:]')
+
+if [ "$MASTER1_STATUS" != "ONLINE" ]; then
+    echo "WARNING: Master1 is not ONLINE (status: $MASTER1_STATUS). Attempting to fix..."
+    docker exec proxysql mysql -h 127.0.0.1 -P 6032 -u admin -padmin -e "
+    UPDATE mysql_servers SET status='ONLINE' WHERE hostname='mysql-master1' AND hostgroup_id=0;
+    LOAD MYSQL SERVERS TO RUNTIME;
+    " 2>/dev/null
+    sleep 3
+fi
+
+if [ "$MASTER2_STATUS" != "ONLINE" ]; then
+    echo "WARNING: Master2 is not ONLINE (status: $MASTER2_STATUS). Attempting to fix..."
+    docker exec proxysql mysql -h 127.0.0.1 -P 6032 -u admin -padmin -e "
+    UPDATE mysql_servers SET status='ONLINE' WHERE hostname='mysql-master2' AND hostgroup_id=0;
+    LOAD MYSQL SERVERS TO RUNTIME;
+    " 2>/dev/null
+    sleep 3
+    echo "Re-checking Master2 status..."
+    check_writer
+fi
 echo ""
 
 echo "Step 2: Inserting test data through ProxySQL"
@@ -58,7 +92,25 @@ echo "Step 4: Stopping Master1 to trigger failover"
 echo "----------------------------------------"
 echo "Stopping mysql-master1 container..."
 docker stop mysql-master1
-sleep 5
+
+echo "Waiting for ProxySQL to detect the failure (this may take a few seconds)..."
+# Wait up to 30 seconds for ProxySQL to detect the failure
+MAX_WAIT=30
+WAITED=0
+while [ $WAITED -lt $MAX_WAIT ]; do
+    sleep 2
+    WAITED=$((WAITED + 2))
+    # Check if Master1 is no longer ONLINE or Master2 is ONLINE
+    STATUS=$(docker exec proxysql mysql -h 127.0.0.1 -P 6032 -u admin -padmin -e "
+    SELECT status FROM runtime_mysql_servers 
+    WHERE hostname = 'mysql-master1' AND hostgroup_id = 0;
+    " 2>/dev/null | grep -v status | tr -d '[:space:]')
+    
+    if [ "$STATUS" != "ONLINE" ] || [ -z "$STATUS" ]; then
+        echo "Master1 failure detected after ${WAITED} seconds"
+        break
+    fi
+done
 
 echo "ProxySQL should automatically detect the failure and route to Master2"
 check_writer

@@ -9,9 +9,12 @@ INSERT INTO mysql_servers (hostname, port, hostgroup_id, weight, comment) VALUES
 ON DUPLICATE KEY UPDATE hostname=VALUES(hostname);
 
 -- Configure replication hostgroups
-INSERT INTO mysql_replication_hostgroups (writer_hostgroup, reader_hostgroup, comment) VALUES
-(0, 1, 'Master-Slave replication group')
-ON DUPLICATE KEY UPDATE writer_hostgroup=VALUES(writer_hostgroup);
+-- INSERT INTO mysql_replication_hostgroups (writer_hostgroup, reader_hostgroup, comment) VALUES
+-- (0, 1, 'Master-Slave replication group')
+-- ON DUPLICATE KEY UPDATE writer_hostgroup=VALUES(writer_hostgroup);
+-- Replication hostgroups removed - not compatible with master-master setup
+-- ProxySQL will use weight-based routing: Master1 (1000) > Master2 (999)
+-- When Master1 fails, ProxySQL automatically routes to Master2
 
 -- Set up user
 INSERT INTO mysql_users (username, password, default_hostgroup, max_connections, default_schema) VALUES

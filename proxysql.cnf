@@ -21,8 +21,11 @@ mysql_variables=
     server_version="8.0.0"
     connect_timeout_server=10000
     monitor_history=60000
-    monitor_connect_interval=200000
-    monitor_ping_interval=200000
+    monitor_connect_interval=2000
+    monitor_ping_interval=2000
+    monitor_username="monitor"
+    monitor_password="monitor"
+    monitor_ssl=false
     ping_timeout_server=200
     commands_stats=true
     sessions_sort=true
@@ -34,24 +37,30 @@ mysql_servers =
         address = "mysql-master1"
         port = 3306
         hostgroup = 0
+        weight = 1000
         max_connections = 200
         max_replication_lag = 10
+        use_ssl = 0
         comment = "Master 1 - Write"
     },
     {
         address = "mysql-master2"
         port = 3306
         hostgroup = 0
+        weight = 999
         max_connections = 200
         max_replication_lag = 10
+        use_ssl = 0
         comment = "Master 2 - Write (Failover)"
     },
     {
         address = "mysql-slave"
         port = 3306
         hostgroup = 1
+        weight = 100
         max_connections = 200
         max_replication_lag = 10
+        use_ssl = 0
         comment = "Slave - Read"
     }
 )
@@ -93,28 +102,18 @@ mysql_query_rules =
     }
 )
 
-mysql_replication_hostgroups =
-(
-    {
-        writer_hostgroup = 0
-        reader_hostgroup = 1
-        comment = "Master-Slave replication group"
-    }
-)
+#mysql_replication_hostgroups =
+#(
+#    {
+#        writer_hostgroup = 0
+#        reader_hostgroup = 1
+#        comment = "Master-Slave replication group"
+#    }
+#)
+# mysql_replication_hostgroups removed - not compatible with master-master setup
+# For master-master, ProxySQL uses weight-based routing within hostgroup 0
+# Both masters are always in hostgroup 0, ProxySQL routes to highest weight ONLINE server
 
-scheduler =
-(
-    {
-        id = 1
-        active = 1
-        interval_ms = 10000
-        filename = "/var/lib/proxysql/proxysql_galera_checker.sh"
-        arg1 = "0"
-        arg2 = "1"
-        arg3 = "1"
-        arg4 = "1"
-        arg5 = "/var/lib/proxysql/proxysql_galera_checker.log"
-        comment = "Galera cluster checker"
-    }
-)
+# Scheduler removed - not needed for master-master setup
+# ProxySQL will use weight-based routing and monitoring for failover
 
